@@ -27,7 +27,7 @@ private:
   UINT clientWidth_, clientHeight_;
 
   HWND hwnd_, hstatus_;
-  HDC hmem_;
+  HDC devcontext_;
   HMENU hctx_;
   bool statusShowing_;
 
@@ -36,7 +36,8 @@ private:
   std::unique_ptr<WatcherThread> watcher_;
   float aspect_, bestAspect_, newAspect_;
   bool best_, wheeling_;
-
+  int loaded_image_height, loaded_image_width, display_image_width, display_image_height;
+  FREE_IMAGE_FILTER resize_method;
   POINT sp_;
   POINT dcDims_;
 
@@ -72,7 +73,7 @@ private:
 
   void DeleteMe();
   void Switch();
-  void AdjustSize(bool increment);
+  void AdjustSize(int direction);
 
   void SetStatus(const std::wstring &aText = _T(""));
 
