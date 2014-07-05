@@ -1,5 +1,5 @@
 #include "MainWindow.h"
-
+#include <assert.h>
 #include <strsafe.h>
 #include <shlwapi.h>
 #include <commctrl.h>
@@ -7,13 +7,14 @@
 #include <shlwapi.h>
 #include <math.h>
 #include <sstream>
-
+#include <memory>
 #include "resource.h"
 #include "console.h"
 #include "Messages.h"
 #include "Objects.h"
 #include "Rect.h"
 #include "procpriority.h"
+
 
 /* timers */
 #define IDT_RELOAD   1
@@ -127,11 +128,17 @@ MainWindow::MainWindow(HINSTANCE aInstance, const std::wstring &aFile)
   newAspect_(1.0f),
   best_(true),
   wheeling_(false),
-  hmem_(nullptr),
+  devcontext_(nullptr),
   inTransformation_(false),
   keyCtrl_(FALSE),
   keyShift_(FALSE),
   mbtnDown_(FALSE),
+  loaded_image_width(0),
+  loaded_image_height(0),
+  display_image_width(0),
+  display_image_height(0),
+
+  resize_method(FILTER_LANCZOS3),
   reg_(HKEY_CURRENT_USER, L"Software\\MaierSoft\\FastPreview")
 {
   InitCommonControls();
@@ -196,9 +203,11 @@ MainWindow::MainWindow(HINSTANCE aInstance, const std::wstring &aFile)
   if (!hstatus_ || hstatus_ == INVALID_HANDLE_VALUE) {
     throw WindowsException();
   }
-
-  SendMessage(hstatus_, SB_SIMPLE, TRUE, 0);
+  
   CreateDC();
+  resize_method = GetResampleMethod();
+  SendMessage(hstatus_, SB_SIMPLE, TRUE, 0);
+  
 }
 
 MainWindow::~MainWindow(void)
@@ -208,7 +217,7 @@ MainWindow::~MainWindow(void)
   DestroyWindow(hwnd_);
   UnregisterClass(_T("FPWND"), hinst_);
   DestroyMenu(hctx_);
-  DeleteDC(hmem_);
+  DeleteDC(devcontext_);
 }
 
 LRESULT MainWindow::WindowProc(
@@ -250,8 +259,8 @@ LRESULT MainWindow::WindowProc(
 
     ONHANDLER(WM_CHAR, OnChar);
 
-    ONHANDLER(WM_MBUTTONDOWN, OnMButton);
-    ONHANDLER(WM_MBUTTONUP, OnMButton);
+    
+    
 
     ONHANDLER(WM_LBUTTONDOWN, OnLButton);
     ONHANDLER(WM_LBUTTONUP, OnLButton);
@@ -262,8 +271,6 @@ LRESULT MainWindow::WindowProc(
 
     ONHANDLER(WM_VSCROLL, OnScroll);
     ONHANDLER(WM_HSCROLL, OnScroll);
-
-    ONHANDLER(WM_MOUSEWHEEL, OnWheel);
 
     ONHANDLER(WM_CONTEXTMENU, OnContextMenu);
 
@@ -304,15 +311,10 @@ HANDLERIMPL(OnShowWindow)
 
 HANDLERIMPL(OnPaint)
 {
-  ConWrite(L"Paint");
+  
   PAINTSTRUCT ps;
   BeginPaint(hwnd_, &ps);
-  ConWrite(itos(ps.rcPaint.left));
-  ConWrite(itos(ps.rcPaint.top));
-  ConWrite(itos(ps.rcPaint.right));
-  ConWrite(itos(ps.rcPaint.bottom));
-  ConWrite(itos(sp_.x));
-  ConWrite(itos(sp_.y));
+  
   if (ps.rcPaint.right - ps.rcPaint.left && ps.rcPaint.bottom - ps.rcPaint.top) {
     BitBlt(
       ps.hdc,
@@ -320,9 +322,9 @@ HANDLERIMPL(OnPaint)
       ps.rcPaint.top,
       ps.rcPaint.right - ps.rcPaint.left,
       ps.rcPaint.bottom - ps.rcPaint.top,
-      hmem_,
-      sp_.x + ps.rcPaint.left,
-      sp_.y + ps.rcPaint.top,
+      devcontext_,
+	  sp_.x + ps.rcPaint.left,
+	  sp_.y + ps.rcPaint.top,
       SRCCOPY
       );
   }
@@ -405,10 +407,6 @@ HANDLERIMPL(OnKey)
     PostQuitMessage(0);
     break;
 
-  case VK_DELETE:
-    DeleteMe();
-    break;
-
   case VK_UP:
   case VK_LEFT:
     PostMessage(
@@ -451,16 +449,27 @@ HANDLERIMPL(OnChar)
     Switch();
     break;
   case '-':
+	  best_ = false;
+	  AdjustSize(0);
+	  break;
+  case '_':
+	  best_ = false;
+	  AdjustSize(0);
+	  break;
   case '+':
-    AdjustSize(wparam == '+');
-    break;
+	  best_ = false;
+	  AdjustSize(1);
+	  break;
+  case '=':
+	  best_ = false;
+	  AdjustSize(1);
+	  break;
 
   case '#':
   case '0':
-    if (!best_) {
+	  !best_;
       aspect_ = 1.0f;
       DoDC();
-    }
     break;
 
   case 'R':
@@ -474,37 +483,11 @@ HANDLERIMPL(OnChar)
   return 0;
 }
 
-HANDLERIMPL(OnMButton)
-{
-  switch (msg) {
-  case WM_MBUTTONDOWN:
-    if (img_.isValid()) {
-      const FreeImage::Information& info = img_.getOriginalInformation();
-      wchar_t mp[20];
-      StringCchPrintf(mp, 20, L"%.2f",
-        (double)info.getWidth() * info.getHeight() / 1000.0 / 1000.0);
-      SetStatus(stringtools::formatResourceString(
-        IDS_INFOS,
-        info.getWidth(),
-        info.getHeight(),
-        stringtools::convert(info.getFormat().getName()).c_str(),
-        mp
-        ).c_str());
-    }
-    return FALSE;
-
-  case WM_MBUTTONUP:
-    SetStatus();
-    return FALSE;
-  }
-  HANDLERPASS;
-}
-
 HANDLERIMPL(OnLButton)
 {
   switch (msg) {
   case WM_LBUTTONDOWN: {
-    ConWrite(L"BtnDown");
+    
     mbtnDown_ = TRUE;
 
     mbtnPos_.x = GET_X_LPARAM(lparam);
@@ -520,7 +503,7 @@ HANDLERIMPL(OnLButton)
 
   case WM_NCMOUSEMOVE:
   case WM_LBUTTONUP: {
-    ConWrite(L"BtnUp");
+    
     mbtnDown_ = FALSE;
     SetCursor(
       LoadCursor(
@@ -534,19 +517,6 @@ HANDLERIMPL(OnLButton)
     return 0;
   }
 
-  case WM_LBUTTONDBLCLK: {
-    SHELLEXECUTEINFO sei;
-    ZeroMemory(&sei, sizeof(sei));
-    sei.cbSize = sizeof(sei);
-    sei.hwnd = hwnd_;
-    sei.fMask = SEE_MASK_FLAG_DDEWAIT | SEE_MASK_INVOKEIDLIST;
-    sei.nShow = SW_SHOWNORMAL;
-    sei.lpVerb = L"properties";
-    sei.lpFile = file_.c_str();
-    ShellExecuteEx(&sei);
-    return 0;
-  }
-
   } // switch
 
   HANDLERPASS;
@@ -555,7 +525,7 @@ HANDLERIMPL(OnLButton)
 HANDLERIMPL(OnMouseMove)
 {
   if (mbtnDown_) {
-    ConWrite(L"Move");
+    
 
     Perform(
       WM_HSCROLL,
@@ -577,7 +547,7 @@ HANDLERIMPL(OnScroll)
 {
   const bool vscroll = (msg == WM_VSCROLL);
   int SB = vscroll ? SB_VERT : SB_HORZ;
-  ConWrite(itos(SB));
+  
 
   SCROLLINFO si;
   si.cbSize = sizeof(SCROLLINFO);
@@ -619,24 +589,14 @@ HANDLERIMPL(OnScroll)
     break;
   }
 
-  ConWrite(L"una:" + itos(v));
+  
   v = max(si.nMin, v);
   v = min(si.nMax - (signed)si.nPage, v);
-  ConWrite(L"adj:" + itos(v));
+  
   SetScrollPos(hwnd_, SB, v, TRUE);
   InvalidateRect(hwnd_, nullptr, FALSE);
   vscroll ? sp_.y = v : sp_.x = v;
 
-  return 0;
-}
-
-HANDLERIMPL(OnWheel)
-{
-  if (wheeling_) {
-    ConWrite(L"Wheeled!");
-    short points = GET_WHEEL_DELTA_WPARAM(wparam) * -10 / WHEEL_DELTA;
-    PostMessage(hwnd_, WM_VSCROLL, MAKEWPARAM(9, points), 0);
-  }
   return 0;
 }
 
@@ -720,12 +680,6 @@ HANDLERIMPL(OnCommand)
     PostQuitMessage(0);
     break;
 
-  case ID_MCTX_DELETEFILE:
-    SetStatus(s_deleting.c_str());
-    DeleteMe();
-    SetStatus();
-    break;
-
   case ID_MCTX_EXPLORERMENU:
     SetStatus(s_explorermenu.c_str());
     try {
@@ -736,7 +690,7 @@ HANDLERIMPL(OnCommand)
       &E
 #endif
       ) {
-      ConWrite(E.GetString());
+      
     }
     SetStatus();
     break;
@@ -811,14 +765,14 @@ HANDLERIMPL(OnSysCommand)
 
 HANDLERIMPL(OnWatch)
 {
-  ConWrite(_T("Watch"));
+  
   if (inTransformation_) {
     HANDLERPASS;
   }
 
   switch (wparam) {
   case FILE_ACTION_REMOVED:
-    ConWrite(L"RECV D");
+  
     PostQuitMessage(0);
     break;
   default:
@@ -826,10 +780,10 @@ HANDLERIMPL(OnWatch)
       FileAttr(file_).getSize();
     }
     catch (Exception) {
-      ConWrite(L"RECV D2");
+      
       PostQuitMessage(0);
     }
-    ConWrite(L"RECV REL");
+    
     LoadFile();
     break;
   }
@@ -841,7 +795,7 @@ HANDLERIMPL(OnTimer)
   switch (wparam) {
   case IDT_RELOAD:
   {
-    ConWrite(_T("LOAD"));
+    
     if (inTransformation_) {
       break;
     }
@@ -855,15 +809,14 @@ HANDLERIMPL(OnTimer)
     }
   }
     break;
-  case IDT_AACCEPT:
-    KillTimer(hwnd_, IDT_AACCEPT);
-    if (newAspect_ != aspect_) {
-      aspect_ = newAspect_;
-      DoDC();
-    }
-    break;
-  }
-
+    case IDT_AACCEPT:
+	{
+		KillTimer(hwnd_, IDT_AACCEPT);
+			aspect_ = newAspect_;
+			DoDC();
+		}
+		break;
+}
   return 0;
 }
 HANDLERIMPL(OnMoving)
@@ -916,24 +869,31 @@ void MainWindow::PreAdjustWindow()
     &wi
     );
   Rect wr(wi.rcWindow), cr(wi.rcClient);
+ 
 
   WorkArea area(hwnd_);
 
+  // get max displayable image size
+
   unsigned
-    maxX = area.width() - (wr.width() - cr.width()),
-    maxY = area.height() - (wr.height() - cr.height());
+    max_width = area.width() - (wr.width() - cr.width()),
+    max_height = area.height() - (wr.height() - cr.height());
+
+  // if in best fit mode figure out the largest size that will fit the screen
 
   if (best_ && img_.isValid()) {
     bestAspect_ = 1.0f;
-    if ((unsigned)img_.getWidth() > maxX) {
-      bestAspect_ = (float)maxX / (float)img_.getWidth();
+    if (loaded_image_width > max_width) {
+      bestAspect_ = (float)max_width / (float)loaded_image_width;
     }
-    if (Height() > maxY) {
-      bestAspect_ = (float)maxY / (float)img_.getHeight();
+    if (loaded_image_height > max_height) {
+      bestAspect_ = (float)max_height / (float)loaded_image_height;
     }
   }
+  
+  // figure out if the image needs scroll bars
 
-  const bool hs = Width() > maxX, vs = Height() > maxY;
+  const bool hs = display_image_width > max_width, vs = display_image_height > max_height;
 
   SCROLLINFO si = {
     sizeof(si),
@@ -945,9 +905,9 @@ void MainWindow::PreAdjustWindow()
     0
   };
   if (hs) {
-    si.nPage = maxX;
-    si.nMax = Width() + (vs ? GetSystemMetrics(SM_CXVSCROLL) : 0);
-    ConWrite(L"hs-p: " + itos(si.nPage) + L" hs-m: " + itos(si.nMax));
+    si.nPage = max_width;
+    si.nMax = display_image_width + (vs ? GetSystemMetrics(SM_CXVSCROLL) : 0);
+    
   }
   SetScrollInfo(
     hwnd_,
@@ -955,9 +915,10 @@ void MainWindow::PreAdjustWindow()
     &si,
     TRUE
     );
+
   if (vs) {
-    si.nPage = maxY;
-    si.nMax = Height() + (hs ? GetSystemMetrics(SM_CYHSCROLL) : 0);
+    si.nPage = max_height;
+    si.nMax = display_image_height + (hs ? GetSystemMetrics(SM_CYHSCROLL) : 0);
   }
 
   SetScrollInfo(
@@ -977,13 +938,19 @@ void MainWindow::PreAdjustWindow()
   }
 
 
-  clientHeight_ = min(maxY, Height());
-  clientWidth_ = min(maxX, Width());
+  clientHeight_ = min(max_height, display_image_height);
+  clientWidth_ = min(max_width, display_image_width);
   if (hs) {
-    clientHeight_ = min(clientHeight_ + GetSystemMetrics(SM_CYHSCROLL), maxY);
+	  clientHeight_ = min((clientHeight_ + GetSystemMetrics(SM_CYHSCROLL)), max_height);
+  }
+  else {
+	  clientHeight_ = min(clientHeight_, max_height);
   }
   if (vs) {
-    clientWidth_ = min(clientWidth_ + GetSystemMetrics(SM_CXVSCROLL), maxX);
+	  clientWidth_ = min((clientWidth_ + GetSystemMetrics(SM_CXVSCROLL)), max_width);
+  }
+  else {
+	  clientWidth_ = min(clientWidth_, max_width);
   }
 
   Rect rw(clientWidth_, clientHeight_);
@@ -993,15 +960,24 @@ void MainWindow::PreAdjustWindow()
     FALSE,
     wi.dwExStyle
     );
+    
+  WorkArea wa(hwnd_);
+  rw.centerIn(wa);
+  
+  InvalidateRect(hwnd_, NULL, FALSE);
 
   MoveWindow(
-    hwnd_,
-    wr.left,
-    wr.top,
-    rw.width(),
-    rw.height(),
-    TRUE
-    );
+	  hwnd_,
+	  rw.left,
+	  rw.top,
+	  rw.width(),
+	  rw.height(),
+	  TRUE
+	  );
+
+  InvalidateRect(hwnd_, NULL, FALSE);
+  
+
 }
 
 void MainWindow::LoadFile()
@@ -1019,6 +995,9 @@ void MainWindow::LoadFile()
   {
     Priority prio(HIGH_PRIORITY_CLASS);
     load = img_.load(file_.c_str());
+	display_image_height = loaded_image_height = img_.getHeight();
+	display_image_width = loaded_image_width = img_.getWidth();
+	sp_.x = sp_.y = 0;
   }
 
   if (!load) {
@@ -1030,22 +1009,22 @@ void MainWindow::LoadFile()
 
     CreateDC();
 
-    if (hmem_ == INVALID_HANDLE_VALUE) {
+    if (devcontext_ == INVALID_HANDLE_VALUE) {
       throw WindowsException();
     }
     SelectObject(
-      hmem_,
+      devcontext_,
       GetStockObject(DEFAULT_GUI_FONT)
       );
 
     RECT  rc = {0, 0, (LONG)Width(), (LONG)Height()};
     FillRect(
-      hmem_,
+      devcontext_,
       &rc,
       (HBRUSH)(COLOR_BTNFACE + 1)
       );
     if (!DrawText(
-      hmem_,
+      devcontext_,
       s_err_load.c_str(),
       -1,
       &rc,
@@ -1069,72 +1048,41 @@ void MainWindow::LoadFile()
 
 void MainWindow::DoDC()
 {
-  ConWrite(_T("DoDC"));
-  ShowScrollBar(hwnd_, SB_BOTH, FALSE);
-  PreAdjustWindow();
-  SetTitle();
+	if (!best_ && aspect_ > 0.95 && aspect_ < 1.05) {
+		const UINT w = display_image_width = loaded_image_width;
+		const UINT h = display_image_height = loaded_image_height;
+		img_.draw(devcontext_, Rect(0, 0, loaded_image_width, loaded_image_height));
+	}
+	else {
+   
+	  const UINT w = display_image_width = loaded_image_width * aspect_;
+	  const UINT h = display_image_height = loaded_image_height * aspect_;
+    
+	  // enlarge device context if required
+	  
+	  if (w > GetDeviceCaps(devcontext_, HORZRES) || h > GetDeviceCaps(devcontext_, VERTRES))
+	  {
+		  HBITMAP hbm = CreateCompatibleBitmap(devcontext_, w, h);
+		  SelectObject(devcontext_, hbm);
+		  DeleteObject(hbm);
+	  }
+	  
+	// rescale and draw - eliminated one trip through FreeImage by cacheing resize_method
+	// if the bitmap is huge this gets really silly
 
-  CreateDC();
-
-  const UINT left = (dcDims_.x - Width()) / 2;
-  const UINT top = (dcDims_.y - Height()) / 2;
-
-  float fasp = fabs(1.f - (best_ ? bestAspect_ : aspect_));
-  if (fasp < 1e-4) {
-    img_.draw(hmem_, Rect(left, top, left + Width(), top + Height()));
-    ConWrite(itos(Width()) + _T("-") + itos(clientWidth_));
-  }
-  else {
-    SetStatus(s_resizing.c_str());
-    const UINT w = Width();
-    const UINT h = Height();
-    try {
+	try {
       FreeImage::WinImage r(img_);
-      r.rescale(w, h, GetResampleMethod());
-      r.draw(hmem_, Rect(left, top, left + w, top + h));
+      r.rescale(w, h, resize_method);
+      r.draw(devcontext_, Rect(0, 0, w, h));
     }
     catch (std::exception& ex) {
       SetStatus(stringtools::convert(ex.what()));
     }
-
-    SetStatus();
+	  
   }
-
-  SHFILEINFO shfi;
-  shfi.hIcon = 0;
-  shfi.iIcon = 0;
-
-  std::wstring e = file_.substr(0, file_.rfind('.') + 1);
-  e.append(stringtools::convert(img_.getOriginalInformation().getFormat().getFirstExtension()));
-
-  UINT iconType = SHGFI_LARGEICON;
-  if (Width() < 160 || Height() < 160) {
-    iconType = SHGFI_SMALLICON;
-  }
-
-  HIMAGELIST hImgList = (HIMAGELIST)SHGetFileInfo(
-    e.c_str(),
-    FILE_ATTRIBUTE_NORMAL,
-    &shfi,
-    sizeof(SHFILEINFO),
-    SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | iconType
-    );
-
-  if (hImgList != nullptr) {
-    if (iconType == SHGFI_SMALLICON) {
-      ImageList_Draw(hImgList, shfi.iIcon, hmem_, dcDims_.x - 5 - GetSystemMetrics(SM_CXSMICON), 5, ILD_TRANSPARENT);
-      //DrawIcon(hmem_, Width() - 5 - GetSystemMetrics(SM_CXICON), 5, shfi.hIcon);
-    }
-    else {
-      ImageList_Draw(hImgList, shfi.iIcon, hmem_, Width() - 10 - GetSystemMetrics(SM_CXICON), 10, ILD_TRANSPARENT);
-    }
-    if (shfi.hIcon != 0) {
-      DestroyIcon(shfi.hIcon);
-    }
-  }
-  sp_.x = sp_.y = 0;
-  CenterWindow();
-  InvalidateRect(hwnd_, nullptr, FALSE);
+    
+  PreAdjustWindow();
+  
 }
 
 void MainWindow::FreeFile()
@@ -1144,28 +1092,21 @@ void MainWindow::FreeFile()
 
 void MainWindow::CreateDC()
 {
-  if (hmem_ != nullptr) {
-    DeleteDC(hmem_);
-    hmem_ = nullptr;
-  }
-  hmem_ = CreateCompatibleDC(nullptr);
-
-  Rect cr;
-  GetClientRect(hwnd_, &cr);
-  const UINT width = max(Width(), (UINT)cr.width());
-  const UINT height = max(Height(), (UINT)cr.height());
-
-
-  DeleteObject(SelectObject(hmem_, CreateCompatibleBitmap(GetDC(hwnd_), width, height)));
-  SetBkMode(
-    hmem_,
-    TRANSPARENT
-    );
-  const Rect r(0, 0, width, height);
-  FillRect(hmem_, &r, (HBRUSH)(COLOR_WINDOW + 1));
-  dcDims_.x = width;
-  dcDims_.y = height;
-}
+	if (devcontext_ == nullptr) {
+		devcontext_ = CreateCompatibleDC(nullptr);
+		
+		HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+		MONITORINFO info;
+		info.cbSize = sizeof(MONITORINFO);
+		GetMonitorInfo(monitor, &info);
+		int monitor_width = info.rcMonitor.right - info.rcMonitor.left;
+		int monitor_height = info.rcMonitor.bottom - info.rcMonitor.top;
+					
+		HBITMAP mbmp = CreateBitmap(3*monitor_width, 3*monitor_height, 1, 32, NULL);
+		SelectObject(devcontext_, mbmp);
+		DeleteObject(mbmp);
+	}
+ }
 
 void MainWindow::ProcessPaint() const
 {
@@ -1175,59 +1116,30 @@ void MainWindow::ProcessPaint() const
   }
 }
 
-void MainWindow::DeleteMe()
-{
-  SetStatus(s_deleting.c_str());
-  auto pFile = std::make_unique <wchar_t[]>(file_.length() + 2);
-  wcscpy_s(
-    pFile.get(),
-    file_.length() + 2,
-    file_.c_str()
-    );
-
-  SHFILEOPSTRUCT op = {
-    hwnd_,
-    FO_DELETE,
-    pFile.get(),
-    nullptr,
-    FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_FILESONLY,
-    FALSE,
-    nullptr,
-    nullptr
-  };
-
-  Thread::Locker l(watcher_.get());
-  SHFileOperation(
-    &op
-    );
-
-  SetStatus();
-}
-
 void MainWindow::Switch()
 {
-  if (img_.isValid()) {
-    best_ = !best_;
-    DoDC();
-  }
+    best_ = false;
+
 }
 
-void MainWindow::AdjustSize(bool increment)
+void MainWindow::AdjustSize(int direction)
 {
-  if (!best_ || !increment || newAspect_ <= bestAspect_) {
-    newAspect_ = increment
-      ? min(5.0f, newAspect_ + 0.1f)
-      : max(0.1f, newAspect_ - 0.1f);
-  }
-
-  if (best_) {
-    Switch();
-    return;
-  }
-
+	int test = 1;
+	if (best_) {
+		Switch();
+	}
+	
+	if (direction == 1) {
+		newAspect_ = min(5.0f, newAspect_ + 0.25f);
+	}
+	if (direction == 0){
+		newAspect_ = max(0.25f, newAspect_ - 0.25f);
+		}
+ 
   SetTitle();
   KillTimer(hwnd_, IDT_AACCEPT);
-  SetTimer(hwnd_, IDT_AACCEPT, 500, nullptr);
+  SetTimer(hwnd_, IDT_AACCEPT, 100, nullptr);
+
 }
 
 void MainWindow::SetTitle()
@@ -1235,25 +1147,6 @@ void MainWindow::SetTitle()
   std::wstringstream ss;
   ss << stringtools::formatResourceString(
     IDS_MAINTITLE, file_.substr(file_.rfind('\\') + 1).c_str());
-  ss << L" - ";
-  if (img_.isValid()) {
-    const FreeImage::Information& info = img_.getOriginalInformation();
-    wchar_t mp[20];
-    StringCchPrintf(mp, 20, L"%.2f",
-      (double)info.getWidth() * info.getHeight() / 1000.0 / 1000.0);
-    ss << stringtools::formatResourceString(
-      IDS_INFOS,
-      info.getWidth(),
-      info.getHeight(),
-      stringtools::convert(info.getFormat().getName()).c_str(),
-      mp
-      );
-    ss << stringtools::formatResourceString(
-      IDS_SCALE, (int)round(100.0 * (best_ ? bestAspect_ : newAspect_)));
-  }
-  else {
-    ss << s_err_unsupported;
-  }
   Perform(
     WM_SETTEXT,
     0,
@@ -1263,22 +1156,7 @@ void MainWindow::SetTitle()
 
 void MainWindow::SetStatus(const std::wstring &aText)
 {
-  if (aText.empty()) {
-    ShowWindow(hstatus_, SW_HIDE);
-    statusShowing_ = false;
-  }
-  else {
-    SendMessage(
-      hstatus_, SB_SETTEXT, (WPARAM)SB_SIMPLEID, (LPARAM)aText.c_str());
-    if (!statusShowing_) {
-      ShowWindow(hstatus_, SW_SHOW);
-      statusShowing_ = true;
-    }
-  }
-  RECT r;
-  GetClientRect(hstatus_, &r);
-  InvalidateRect(hwnd_, &r, FALSE);
-  ProcessPaint();
+
 }
 
 void MainWindow::CenterWindow() const
