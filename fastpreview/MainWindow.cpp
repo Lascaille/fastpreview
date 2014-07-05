@@ -1055,8 +1055,16 @@ void MainWindow::DoDC()
 	}
 	else {
    
+   // if aspect is greater than 4, resize here 4x and then later StretchBlt
+   
+   if { aspect > 4 } {
+   	  const UINT w = display_image_width = loaded_image_width * 4;
+	  const UINT h = display_image_height = loaded_image_height * 4;
+   }
+   else {
 	  const UINT w = display_image_width = loaded_image_width * aspect_;
 	  const UINT h = display_image_height = loaded_image_height * aspect_;
+   }
     
 	  // enlarge device context if required
 	  
@@ -1069,6 +1077,9 @@ void MainWindow::DoDC()
 	  
 	// rescale and draw - eliminated one trip through FreeImage by cacheing resize_method
 	// if the bitmap is huge this gets really silly
+	// if the aspect is greater than 4 I think we'll need to rescale to 4x
+	// and then StretchBlt it onto the device context to avoid slowness
+	// we'll do that in the actual paint code for now
 
 	try {
       FreeImage::WinImage r(img_);
